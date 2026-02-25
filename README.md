@@ -16,3 +16,6 @@ streamlit run main.py
 
 ## Requirements
 See `requirements.txt` for Python package dependencies.
+
+## Author
+Qamber
