@@ -18,4 +18,4 @@ streamlit run main.py
 See `requirements.txt` for Python package dependencies.
 
 ## Author
-Qamber
+Qamber Muhammad Hanif
