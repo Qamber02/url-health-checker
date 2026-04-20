@@ -8,17 +8,18 @@ Requirements:
     pip install streamlit pandas requests urllib3
 """
 
+import hashlib
 import ipaddress
 import logging
 import re
-import signal
 import socket
 import time
 import threading
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
-from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
+from urllib.parse import urlparse, urlencode, parse_qs, urlunparse, urljoin
 
 import pandas as pd
 import requests
@@ -38,125 +39,189 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-MAX_INPUT_BYTES     = 1 * 1024 * 1024   # 1 MB guard
-MAX_WORKERS         = 10                # conservative
-DEFAULT_TIMEOUT     = 5                 # seconds
-MAX_USER_TIMEOUT    = 10                # hard ceiling users can't override
-MAX_URLS            = 200               # tighter cap (was 500)
-MAX_JOB_SECONDS     = 120              # hard wall on total job time
-USER_AGENT          = (
+MAX_INPUT_BYTES      = 1 * 1024 * 1024
+MAX_WORKERS          = 10
+DEFAULT_TIMEOUT      = 5
+MAX_USER_TIMEOUT     = 10
+MAX_URLS             = 200
+MAX_JOB_SECONDS      = 120
+MAX_REDIRECT_DEPTH   = 10
+USER_AGENT           = (
     "Mozilla/5.0 (compatible; URLHealthChecker/1.0; "
     "+https://github.com/your-org/url-health-checker)"
 )
-RETRY_TOTAL         = 2
-RETRY_BACKOFF       = 0.3
-RETRY_STATUS_CODES  = (429, 500, 502, 503, 504)
 
-# Allowed file types — plain text only; no XML/JSON/HTML parsing
-ALLOWED_EXTENSIONS  = ["txt", "md", "log"]
+# No status-based retries — prevents 3x amplification / DDoS relay behaviour.
+# One connect retry only, for transient TCP resets.
+RETRY_TOTAL          = 1
+RETRY_BACKOFF        = 0.3
 
-# Ports we are willing to connect to on external hosts
-ALLOWED_PORTS       = {80, 443, 8080, 8443}
+ALLOWED_EXTENSIONS   = ["txt", "md", "log"]
+ALLOWED_PORTS        = {80, 443, 8080, 8443}
 
-# RFC-1918 and other private / link-local / loopback ranges
-_PRIVATE_NETWORKS   = [
+_PRIVATE_NETWORKS    = [
     ipaddress.ip_network("10.0.0.0/8"),
     ipaddress.ip_network("172.16.0.0/12"),
     ipaddress.ip_network("192.168.0.0/16"),
     ipaddress.ip_network("127.0.0.0/8"),
-    ipaddress.ip_network("169.254.0.0/16"),   # AWS/GCP/Azure metadata
+    ipaddress.ip_network("169.254.0.0/16"),
     ipaddress.ip_network("0.0.0.0/8"),
-    ipaddress.ip_network("100.64.0.0/10"),    # CGNAT
+    ipaddress.ip_network("100.64.0.0/10"),
     ipaddress.ip_network("::1/128"),
     ipaddress.ip_network("fc00::/7"),
     ipaddress.ip_network("fe80::/10"),
 ]
 
-# Characters that make a CSV field a formula in Excel / LibreOffice
-_FORMULA_CHARS      = ("=", "+", "-", "@", "\t", "\r", "|", "%")
+_FORMULA_CHARS       = ("=", "+", "-", "@", "\t", "\r", "|", "%")
+
 
 # ---------------------------------------------------------------------------
-# Rate limiting (simple token bucket, per-session)
+# Rate limiting — IP-fingerprinted, bounded OrderedDict, OOM-safe
 # ---------------------------------------------------------------------------
-_rate_limit_store: dict[str, list[float]] = {}
-_rate_lock = threading.Lock()
-RATE_LIMIT_WINDOW   = 60   # seconds
-RATE_LIMIT_MAX      = 5    # runs per window per session
+_MAX_RATE_STORE_ENTRIES = 50_000
+_rate_limit_store: OrderedDict = OrderedDict()
+_rate_lock           = threading.Lock()
+RATE_LIMIT_WINDOW    = 60
+RATE_LIMIT_MAX       = 5
 
 
-def _check_rate_limit(session_id: str) -> bool:
-    """Return False if the session has exceeded the allowed request rate."""
-    now = time.time()
+def _get_client_fingerprint() -> str:
+    """
+    Best-effort stable identifier for the connecting client.
+    Prefers the real IP from a forwarding header; falls back to the
+    Streamlit WebSocket session ID. Hashed so no raw IPs are stored.
+    """
+    try:
+        headers = st.context.headers
+        ip = (
+            headers.get("X-Forwarded-For", "").split(",")[0].strip()
+            or headers.get("X-Real-IP", "")
+        )
+    except Exception:
+        ip = ""
+
+    if not ip:
+        try:
+            ip = st.runtime.scriptrunner.get_script_run_ctx().session_id
+        except Exception:
+            ip = "unknown"
+
+    return hashlib.sha256(ip.encode()).hexdigest()[:16]
+
+
+def _check_rate_limit(fingerprint: str) -> bool:
+    """
+    Sliding-window rate limiter. Evicts stale entries on every call
+    to prevent unbounded dict growth. Caps the store as an absolute safety net.
+    """
+    now          = time.time()
     window_start = now - RATE_LIMIT_WINDOW
+
     with _rate_lock:
-        calls = [t for t in _rate_limit_store.get(session_id, []) if t > window_start]
+        keys_to_delete = [
+            k for k, calls in list(_rate_limit_store.items())
+            if not calls or max(calls) <= window_start
+        ]
+        for k in keys_to_delete:
+            del _rate_limit_store[k]
+
+        while len(_rate_limit_store) >= _MAX_RATE_STORE_ENTRIES:
+            _rate_limit_store.popitem(last=False)
+
+        calls = [t for t in _rate_limit_store.get(fingerprint, []) if t > window_start]
         if len(calls) >= RATE_LIMIT_MAX:
             return False
         calls.append(now)
-        _rate_limit_store[session_id] = calls
+        _rate_limit_store[fingerprint] = calls
+        _rate_limit_store.move_to_end(fingerprint)
+
     return True
 
 
 # ---------------------------------------------------------------------------
-# SSRF protection
+# URL normalization
 # ---------------------------------------------------------------------------
-def _is_safe_url(url: str) -> tuple[bool, str]:
+def _normalize_url(url: str) -> Optional[str]:
     """
-    Return (True, "") if the URL is safe to fetch.
-    Return (False, reason) if it should be blocked.
+    Canonicalize a URL to exactly what requests will fetch.
+    Strips fragments, rejects embedded credentials.
+    Returns None if the URL is structurally invalid.
+    """
+    try:
+        parsed = urlparse(url)
+        if parsed.username or parsed.password:
+            return None
+        return urlunparse(parsed._replace(fragment=""))
+    except Exception:
+        return None
 
-    Checks:
-      - Scheme must be http or https
-      - Port must be in ALLOWED_PORTS
-      - Resolved IP must not be in any private/reserved range
+
+def _resolve_to_ip_bound_url(url: str) -> tuple:
+    """
+    Resolve the hostname once, validate every returned IP against the
+    private-network blocklist, then rewrite the URL to use the literal
+    IP address. This pins the DNS resolution so the IP we validated is
+    the IP requests actually connects to — eliminating DNS rebinding / TOCTOU.
+
+    Returns (ip_bound_url, original_hostname, error_reason).
+    On success: (url_with_literal_ip, hostname, "")
+    On failure: (None, None, reason)
     """
     try:
         parsed = urlparse(url)
     except ValueError as exc:
-        return False, f"Parse error: {exc}"
+        return None, None, f"Parse error: {exc}"
 
     if parsed.scheme not in ("http", "https"):
-        return False, f"Scheme not allowed: {parsed.scheme}"
+        return None, None, f"Scheme not allowed: {parsed.scheme}"
 
     port = parsed.port
     if port is None:
         port = 443 if parsed.scheme == "https" else 80
     if port not in ALLOWED_PORTS:
-        return False, f"Port not allowed: {port}"
+        return None, None, f"Port not allowed: {port}"
 
     hostname = parsed.hostname
     if not hostname:
-        return False, "No hostname"
+        return None, None, "No hostname"
 
     try:
-        # Resolve hostname → check every returned address
-        infos = socket.getaddrinfo(hostname, None)
+        infos = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
     except socket.gaierror as exc:
-        return False, f"DNS resolution failed: {exc}"
+        return None, None, f"DNS resolution failed: {exc}"
 
-    for info in infos:
-        ip_str = info[4][0]
+    if not infos:
+        return None, None, "DNS returned no results"
+
+    for family, _, _, _, sockaddr in infos:
+        ip_str = sockaddr[0]
         try:
             ip = ipaddress.ip_address(ip_str)
         except ValueError:
-            return False, f"Invalid IP: {ip_str}"
+            return None, None, f"Invalid IP from DNS: {ip_str}"
         for net in _PRIVATE_NETWORKS:
             if ip in net:
-                return False, f"Private/reserved address: {ip}"
+                return None, None, f"Private/reserved address: {ip}"
 
-    return True, ""
+    chosen_ip = infos[0][4][0]
+    netloc_ip  = f"[{chosen_ip}]" if ":" in chosen_ip else chosen_ip
+    if parsed.port:
+        netloc_ip += f":{parsed.port}"
+
+    ip_bound_url = urlunparse(parsed._replace(netloc=netloc_ip))
+    return ip_bound_url, hostname, ""
 
 
 # ---------------------------------------------------------------------------
 # URL sanitization helpers
 # ---------------------------------------------------------------------------
 def _redact_url_for_log(url: str) -> str:
-    """Strip query-param values before writing a URL to logs."""
+    """Replace query-param values with [REDACTED] before writing to logs."""
     try:
-        parsed = urlparse(url)
+        parsed   = urlparse(url)
         if not parsed.query:
             return url
-        params = parse_qs(parsed.query, keep_blank_values=True)
+        params   = parse_qs(parsed.query, keep_blank_values=True)
         redacted = {k: ["[REDACTED]"] for k in params}
         return urlunparse(parsed._replace(query=urlencode(redacted, doseq=True)))
     except Exception:
@@ -164,14 +229,13 @@ def _redact_url_for_log(url: str) -> str:
 
 
 def _sanitize_csv_field(value: object) -> object:
-    """Prefix formula-injection characters so spreadsheet apps treat them as text."""
+    """Prefix formula-injection chars so spreadsheets treat the cell as text."""
     if isinstance(value, str) and value and value[0] in _FORMULA_CHARS:
         return "'" + value
     return value
 
 
 def _sanitize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """Apply CSV formula injection sanitization to all string columns."""
     out = df.copy()
     for col in out.select_dtypes(include="object").columns:
         out[col] = out[col].apply(_sanitize_csv_field)
@@ -189,7 +253,6 @@ class CheckerConfig:
     follow_redirects: bool = True
 
     def __post_init__(self) -> None:
-        # Enforce server-side ceilings regardless of what the UI sends
         self.timeout     = min(self.timeout, MAX_USER_TIMEOUT)
         self.max_workers = min(self.max_workers, MAX_WORKERS)
 
@@ -198,28 +261,36 @@ class CheckerConfig:
 # Extraction
 # ---------------------------------------------------------------------------
 class Extractor:
-    def extract(self, text: str) -> list[str]:
+    def extract(self, text: str) -> list:
         raise NotImplementedError
 
 
 class URLExtractor(Extractor):
-    """Extracts unique, validated, SSRF-safe http/https URLs from arbitrary text."""
+    """Extracts unique, normalized, SSRF-safe http/https URLs from arbitrary text."""
 
     _PATTERN = re.compile(r'https?://[^\s\[\]"<>{}|\\^`]+')
 
-    def extract(self, text: str) -> list[str]:
-        found = self._PATTERN.findall(text)
-        seen:   set[str]  = set()
-        unique: list[str] = []
+    def extract(self, text: str) -> list:
+        found  = self._PATTERN.findall(text)
+        seen   = set()
+        unique = []
 
         for raw in found:
-            url = raw.rstrip(".,;:)")
+            # Strip trailing punctuation — single pass, not greedy rstrip
+            url = re.sub(r'[.,;:)]+$', '', raw)
+
+            url = _normalize_url(url)
+            if url is None:
+                continue
+
             if not self._is_valid_format(url):
                 continue
-            safe, reason = _is_safe_url(url)
-            if not safe:
+
+            ip_bound, hostname, reason = _resolve_to_ip_bound_url(url)
+            if ip_bound is None:
                 logger.info("Blocked URL %s — %s", _redact_url_for_log(url), reason)
                 continue
+
             if url not in seen:
                 seen.add(url)
                 unique.append(url)
@@ -269,16 +340,21 @@ class URLResult:
 
 
 def _make_session(config: CheckerConfig) -> requests.Session:
-    """Return a requests.Session with retry logic and safe defaults."""
+    """
+    Build a requests.Session. Status-based retries are disabled to prevent
+    the app being used as a DDoS amplifier (no 3x on 5xx). One connect retry
+    only for transient resets.
+    """
     session = requests.Session()
-    session.max_redirects = 10
+    session.max_redirects = MAX_REDIRECT_DEPTH
     session.headers.update({"User-Agent": USER_AGENT})
 
     retry = Retry(
         total=RETRY_TOTAL,
+        connect=1,
+        read=0,
+        status=0,
         backoff_factor=RETRY_BACKOFF,
-        status_forcelist=RETRY_STATUS_CODES,
-        allowed_methods={"HEAD", "GET"},
         raise_on_status=False,
     )
     adapter = HTTPAdapter(max_retries=retry)
@@ -296,8 +372,11 @@ def _get_session(config: CheckerConfig) -> requests.Session:
     return _thread_local.session
 
 
-def _clear_thread_sessions() -> None:
-    """Close and drop the thread-local session to prevent state bleed between jobs."""
+def _clear_session_in_worker() -> None:
+    """
+    Close and drop this worker thread's session. Must be submitted as a pool
+    task — calling from the main thread only clears the main thread's session.
+    """
     if hasattr(_thread_local, "session"):
         try:
             _thread_local.session.close()
@@ -313,58 +392,89 @@ class URLTester:
         self.config = config
 
     def test(self, url: str) -> URLResult:
-        session = _get_session(self.config)
-        if self.config.use_head:
-            result = self._request(session, "HEAD", url)
-            if result.error or result.status_code in (405, 501):
-                result = self._request(session, "GET", url)
-        else:
-            result = self._request(session, "GET", url)
+        method = "HEAD" if self.config.use_head else "GET"
+        result = self._follow_url(url, method, depth=0)
+        if self.config.use_head and (result.error or result.status_code in (405, 501)):
+            result = self._follow_url(url, "GET", depth=0)
         return result
 
-    def _request(self, session: requests.Session, method: str, url: str) -> URLResult:
+    def _follow_url(self, url: str, method: str, depth: int) -> URLResult:
+        """
+        Depth-tracked entry point for a fetch + redirect chain.
+        Re-validates and re-pins the IP on every hop.
+        """
+        if depth > MAX_REDIRECT_DEPTH:
+            return URLResult(url=url, error="Too many redirects", method_used=method)
+
+        ip_bound, hostname, reason = _resolve_to_ip_bound_url(url)
+        if ip_bound is None:
+            return URLResult(url=url, error=f"Blocked: {reason}", method_used=method)
+
+        session = _get_session(self.config)
+        return self._request(session, method, url, ip_bound, hostname, depth)
+
+    def _request(
+        self,
+        session:   requests.Session,
+        method:    str,
+        orig_url:  str,
+        ip_bound:  str,
+        hostname:  str,
+        depth:     int,
+    ) -> URLResult:
+        """
+        Single HTTP request using the IP-bound URL with the original Host header.
+        Validates and resolves redirect Location values before following them.
+        """
         start = time.perf_counter()
         try:
-            # Fetch without auto-redirect so we can validate the destination first
             resp = session.request(
                 method,
-                url,
+                ip_bound,
+                headers={"Host": hostname},
                 timeout=self.config.timeout,
                 allow_redirects=False,
                 stream=True,
+                verify=True,
             )
 
-            # Validate redirect destination before following
             if resp.is_redirect and self.config.follow_redirects:
-                location = resp.headers.get("Location", "")
-                if location:
-                    safe, reason = _is_safe_url(location)
-                    if not safe:
-                        logger.warning(
-                            "Redirect blocked for %s: %s",
-                            _redact_url_for_log(url), reason,
-                        )
-                        resp.close()
-                        return URLResult(
-                            url=url,
-                            status_code=resp.status_code,
-                            error="Redirect to private/disallowed host blocked",
-                            method_used=method,
-                        )
-                    resp.close()
-                    # Follow the safe redirect
-                    return self._request(session, method, location)
+                location = resp.headers.get("Location", "").strip()
+                resp.close()
+
+                if not location:
+                    return URLResult(
+                        url=orig_url,
+                        status_code=resp.status_code,
+                        error="Redirect with empty Location",
+                        method_used=method,
+                    )
+
+                # Resolve relative redirects (//host/path, /path) against the
+                # original URL before any validation — this is the key fix for
+                # the protocol-relative and path-relative SSRF bypass.
+                absolute_location = urljoin(orig_url, location)
+                absolute_location = _normalize_url(absolute_location)
+                if absolute_location is None:
+                    return URLResult(
+                        url=orig_url,
+                        status_code=resp.status_code,
+                        error="Redirect URL rejected (credentials or malformed)",
+                        method_used=method,
+                    )
+
+                return self._follow_url(absolute_location, method, depth + 1)
 
             resp.close()
             elapsed_ms = round((time.perf_counter() - start) * 1000)
-            final = resp.url if resp.url != url else ""
+            final      = orig_url if resp.url == ip_bound else ""
 
             logger.info(
                 "%-8s %-60s  %d  (%d ms)",
-                method, _redact_url_for_log(url), resp.status_code, elapsed_ms,
+                method, _redact_url_for_log(orig_url), resp.status_code, elapsed_ms,
             )
             return URLResult(
-                url=url,
+                url=orig_url,
                 status_code=resp.status_code,
                 response_time_ms=elapsed_ms,
                 final_url=final,
@@ -372,33 +482,34 @@ class URLTester:
             )
 
         except requests.exceptions.Timeout:
-            logger.warning("Timeout [%s]: %s", method, _redact_url_for_log(url))
-            return URLResult(url=url, error="Timeout", method_used=method)
+            logger.warning("Timeout [%s]: %s", method, _redact_url_for_log(orig_url))
+            return URLResult(url=orig_url, error="Timeout", method_used=method)
 
         except requests.exceptions.TooManyRedirects:
-            logger.warning("Too many redirects [%s]: %s", method, _redact_url_for_log(url))
-            return URLResult(url=url, error="Too many redirects", method_used=method)
+            logger.warning("Too many redirects [%s]: %s", method, _redact_url_for_log(orig_url))
+            return URLResult(url=orig_url, error="Too many redirects", method_used=method)
 
         except requests.exceptions.SSLError as exc:
+            # Never surface the raw exception — it may contain internal hostnames or cert CNs
             err_str = str(exc).lower()
             if "certificate verify failed" in err_str:
-                friendly = "SSL: certificate not trusted (possible MITM or self-signed cert)"
+                friendly = "SSL: certificate not trusted"
             elif "certificate has expired" in err_str:
                 friendly = "SSL: certificate expired"
             elif "hostname" in err_str:
-                friendly = "SSL: hostname mismatch (possible MITM)"
+                friendly = "SSL: hostname mismatch"
             else:
-                friendly = "SSL error (see server logs for details)"
-            logger.warning("SSL error [%s]: %s", method, _redact_url_for_log(url))
-            return URLResult(url=url, error=friendly, method_used=method)
+                friendly = "SSL handshake failed"
+            logger.warning("SSL error [%s] %s: %s", method, _redact_url_for_log(orig_url), exc)
+            return URLResult(url=orig_url, error=friendly, method_used=method)
 
         except requests.exceptions.ConnectionError:
-            logger.warning("Connection error [%s]: %s", method, _redact_url_for_log(url))
-            return URLResult(url=url, error="Connection error", method_used=method)
+            logger.warning("Connection error [%s]: %s", method, _redact_url_for_log(orig_url))
+            return URLResult(url=orig_url, error="Connection error", method_used=method)
 
         except requests.RequestException as exc:
-            logger.warning("Request failed [%s] %s", method, _redact_url_for_log(url))
-            return URLResult(url=url, error=str(exc), method_used=method)
+            logger.warning("Request failed [%s] %s: %s", method, _redact_url_for_log(orig_url), exc)
+            return URLResult(url=orig_url, error="Request failed", method_used=method)
 
 
 # ---------------------------------------------------------------------------
@@ -411,30 +522,24 @@ class HealthManager:
         self.extractor = extractor
         self.tester    = tester
 
-    def run(
-        self,
-        text:        str,
-        progress_cb  = None,
-    ) -> list[URLResult]:
+    def run(self, text: str, progress_cb=None) -> tuple:
         urls = self.extractor.extract(text)
         if not urls:
-            return []
+            return [], False
 
-        results:    list[URLResult] = []
-        done_count  = 0
-        total       = len(urls)
-        timed_out   = False
-
-        # Hard wall: cancel remaining futures if the job exceeds MAX_JOB_SECONDS
-        deadline = time.monotonic() + MAX_JOB_SECONDS
+        results    = []
+        done_count = 0
+        total      = len(urls)
+        timed_out  = False
+        deadline   = time.monotonic() + MAX_JOB_SECONDS
 
         max_w = min(self.tester.config.max_workers, total)
         with ThreadPoolExecutor(max_workers=max_w) as pool:
             futures = {pool.submit(self.tester.test, url): url for url in urls}
+
             for future in as_completed(futures):
                 if time.monotonic() > deadline:
                     timed_out = True
-                    # Cancel remaining futures (best-effort)
                     for f in futures:
                         f.cancel()
                     break
@@ -444,14 +549,20 @@ class HealthManager:
                     results.append(future.result())
                 except Exception as exc:
                     logger.error("Unexpected error for %s: %s", _redact_url_for_log(url), exc)
-                    results.append(URLResult(url=url, error=f"Unexpected: {exc}"))
+                    results.append(URLResult(url=url, error="Unexpected error"))
                 finally:
                     done_count += 1
                     if progress_cb:
                         progress_cb(done_count, total)
 
-        # Clean up thread-local sessions after each job run to prevent state bleed
-        _clear_thread_sessions()
+            # Clean up worker-thread sessions from inside the pool — not from the
+            # main thread, which has its own separate _thread_local namespace.
+            cleanup = [pool.submit(_clear_session_in_worker) for _ in range(max_w)]
+            for f in cleanup:
+                try:
+                    f.result(timeout=2)
+                except Exception:
+                    pass
 
         if timed_out:
             logger.warning(
@@ -507,10 +618,8 @@ def _render_results(df: pd.DataFrame) -> None:
         },
         inplace=True,
     )
-
     st.dataframe(display_df, use_container_width=True, hide_index=True)
 
-    # Sanitize CSV export to prevent formula injection
     safe_df   = _sanitize_dataframe(df)
     csv_bytes = safe_df.to_csv(index=False).encode("utf-8")
     st.download_button(
@@ -533,16 +642,7 @@ def main() -> None:
     st.title("🔗 URL Health Checker")
     st.caption("Extract, test, and monitor URLs from any text or file.")
 
-    # ---- Rate limiting (keyed by Streamlit session ID) ----
-    session_id = st.runtime.scriptrunner.get_script_run_ctx().session_id
-    if not _check_rate_limit(session_id):
-        st.error(
-            f"Too many requests. You can run up to {RATE_LIMIT_MAX} checks "
-            f"per {RATE_LIMIT_WINDOW} seconds."
-        )
-        return
-
-    # ---- Sidebar ----
+    # Build the sidebar before the run-gate so the UI renders on all reruns
     with st.sidebar:
         st.header("⚙️ Settings")
         timeout = st.slider(
@@ -575,7 +675,6 @@ def main() -> None:
                 help="Accepted: .txt, .md, .log",
             )
             if uploaded is not None:
-                # Check size BEFORE reading into memory
                 uploaded.seek(0, 2)
                 file_size = uploaded.tell()
                 uploaded.seek(0)
@@ -595,7 +694,6 @@ def main() -> None:
 
         run = st.button("🚀 Run Check", type="primary", use_container_width=True)
 
-    # ---- Main area ----
     if "results_df" not in st.session_state:
         st.session_state["results_df"] = None
 
@@ -605,6 +703,13 @@ def main() -> None:
             _render_results(st.session_state["results_df"])
         else:
             st.info("Configure your input in the sidebar, then click **Run Check**.")
+        return
+
+    # Rate limit check — inside the run gate so slider moves don't burn quota
+    fp = _get_client_fingerprint()
+    if not _check_rate_limit(fp):
+        # Generic message — never reveal the exact window size or limit to the client
+        st.error("Too many requests. Please wait before running another check.")
         return
 
     if not input_text.strip():
